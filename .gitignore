@@ -2,3 +2,7 @@
 *.egg-info
 __pycache__/
 outputs/
+*.mp4
+*.png
+*.pdf
+calibrations/
