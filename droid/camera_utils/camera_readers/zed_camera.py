@@ -227,3 +227,103 @@ class ZedCamera:
 
     def is_running(self):
         return self.current_mode != "disabled"
+
+    ### Camera Settings ###
+    def set_exposure(self, exposure_value=None, auto=True):
+        """
+        Set camera exposure.
+        
+        Args:
+            exposure_value: Exposure value (0-100) when auto=False. None uses current value.
+            auto: If True, enable auto exposure. If False, use manual exposure with exposure_value.
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before changing settings")
+        
+        if auto:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        else:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
+            if exposure_value is not None:
+                self._cam.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, exposure_value)
+    
+    def set_gain(self, gain_value=None, auto=True):
+        """
+        Set camera gain.
+        
+        Args:
+            gain_value: Gain value (0-100) when auto=False. None uses current value.
+            auto: If True, enable auto gain. If False, use manual gain with gain_value.
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before changing settings")
+        
+        if auto:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        else:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
+            if gain_value is not None:
+                self._cam.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, gain_value)
+    
+    def set_brightness(self, brightness_value):
+        """
+        Set camera brightness.
+        
+        Args:
+            brightness_value: Brightness value (0-8)
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before changing settings")
+        
+        self._cam.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, brightness_value)
+    
+    def set_contrast(self, contrast_value):
+        """
+        Set camera contrast.
+        
+        Args:
+            contrast_value: Contrast value (0-8)
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before changing settings")
+        
+        self._cam.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, contrast_value)
+    
+    def set_white_balance(self, temperature=None, auto=True):
+        """
+        Set camera white balance.
+        
+        Args:
+            temperature: Color temperature in Kelvin (2800-6500) when auto=False
+            auto: If True, enable auto white balance. If False, use manual temperature.
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before changing settings")
+        
+        if auto:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
+        else:
+            self._cam.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 0)
+            if temperature is not None:
+                self._cam.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE, temperature)
+    
+    def get_camera_settings(self):
+        """
+        Get current camera settings.
+        
+        Returns:
+            dict: Dictionary of current camera settings
+        """
+        if not hasattr(self, "_cam") or self.current_mode == "disabled":
+            raise RuntimeError("Camera must be opened before reading settings")
+        
+        settings = {
+            "exposure": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE),
+            "gain": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.GAIN),
+            "brightness": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS),
+            "contrast": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.CONTRAST),
+            "aec_agc": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC),
+            "white_balance_temp": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE),
+            "white_balance_auto": self._cam.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO),
+        }
+        return settings

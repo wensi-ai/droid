@@ -120,38 +120,11 @@ def detect_charuco_corners(image, camera_matrix, dist_coeffs):
         image_with_markers, charuco_corners, charuco_ids
     )
 
-    # Need at least 4 corners for PnP
-    if len(charuco_corners) < 4:
+    # Need at least 6 corners for PnP (solvePnP requires >= 6 points)
+    if len(charuco_corners) < 6:
         return None, None, image_with_markers
 
     return charuco_corners, charuco_ids, image_with_markers
-
-
-def calibrate_hand_eye(R_gripper2base, t_gripper2base, R_target2cam, t_target2cam):
-    """
-    Solve hand-eye calibration using Tsai-Lenz method
-    This is simplified version of cv2.calibrateHandEye
-
-    For third-person camera:
-    - Robot holds board (board attached to gripper)
-    - Camera observes from fixed position
-    - Solve: AX = XB where X is camera-to-base transform
-    """
-    n = len(R_gripper2base)
-    if n < 3:
-        return None, None
-
-    # Use OpenCV's implementation for now (we can replace with pure math later)
-    # This solves AX = XB problem
-    R_cam2base, t_cam2base = cv2.calibrateHandEye(
-        R_gripper2base=R_gripper2base,
-        t_gripper2base=t_gripper2base,
-        R_target2cam=R_target2cam,
-        t_target2cam=t_target2cam,
-        method=cv2.CALIB_HAND_EYE_TSAI  # Tsai-Lenz method
-    )
-
-    return R_cam2base, t_cam2base
 
 
 class SimpleZEDCalibrator:
