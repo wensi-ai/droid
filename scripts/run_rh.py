@@ -10,7 +10,7 @@ import time
 from moviepy.editor import ImageSequenceClip
 import numpy as np
 from openpi_client import image_tools
-from scripts.network_utils import WebsocketClientPolicy
+from openpi_client import websocket_client_policy
 import pandas as pd
 from PIL import Image
 from droid.robot_env import RobotEnv
@@ -27,7 +27,7 @@ DROID_CONTROL_FREQUENCY = 15
 class Args:
     # Hardware parameters
     left_camera_id: str = "38178251"  # e.g., "24514023"
-    # right_camera_id: str = "39762559"  # e.g., "2425987687"
+    # right_camera_id: str = "39762559"  # e.g., "24259877"
     wrist_camera_id: str = "16606959"  # e.g., "13062452"
 
     # Policy parameters
@@ -35,12 +35,11 @@ class Args:
         "left"  # which external camera should be fed to the policy, choose from ["left", "right"]
     )
 
-    # Camera parameters
-    # Manual exposure value (0-100). Set to None to use auto exposure.
-    exposure: int | None = 30
-
     # Rollout parameters
-    max_timesteps: int = 1000
+    max_timesteps: int = 600
+    # How many actions to execute from a predicted action chunk before querying policy server again
+    # 8 is usually a good default (equals 0.5 seconds of action execution).
+    open_loop_horizon: int = 16
 
     # Remote server parameters
     remote_host: str = "0.0.0.0"  # point this to the IP address of the policy server, e.g., "192.168.1.100"
@@ -77,28 +76,21 @@ def main(args: Args):
         args.external_camera is not None and args.external_camera in ["left", "right"]
     ), f"Please specify an external camera to use for the policy, choose from ['left', 'right'], but got {args.external_camera}"
 
-    # Initialize the Panda environment. Using joint position action space and gripper position action space is very important.
+    # Initialize the Panda environment. Using joint velocity action space and gripper position action space is very important.
     env = RobotEnv(action_space="joint_position", gripper_action_space="position")
     print("Created the droid env!")
 
-    # Set camera exposure
-    for cam_id in [args.left_camera_id, args.wrist_camera_id]:
-        cam = env.camera_reader.get_camera(cam_id)
-        if args.exposure is None:
-            cam.set_exposure(auto=True)
-        else:
-            cam.set_exposure(exposure_value=args.exposure, auto=False)
-            print(f"Camera {cam_id}: set manual exposure to {args.exposure}")
-
     # Connect to the policy server
-    policy_client = WebsocketClientPolicy(args.remote_host, args.remote_port)
+    policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
 
     df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
     while True:
         instruction = input("Enter instruction: ")
-        # reset the policy client
-        policy_client.reset()
+
+        # Rollout parameters
+        actions_from_chunk_completed = 0
+        pred_action_chunk = None
 
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
@@ -118,38 +110,43 @@ def main(args: Args):
 
                 video.append(curr_obs[f"{args.external_camera}_image"])
 
-                # # Visualize camera feeds (images are RGB; convert to BGR for cv2)
-                # vis_external = curr_obs[f"{args.external_camera}_image"][..., ::-1]
-                # vis_wrist = curr_obs["wrist_image"][..., ::-1]
-                # combined_vis = np.concatenate([vis_external, vis_wrist], axis=1)
-                # cv2.imshow("External | Wrist", combined_vis)
-                # cv2.waitKey(1)
+                # Send websocket request to policy server if it's time to predict a new chunk
+                if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
+                    actions_from_chunk_completed = 0
 
-                # We resize images on the robot laptop to minimize the amount of data sent to the policy server
-                # and improve latency.
-                request_data = {
-                    "external::external_camera_1::rgb": image_tools.resize_with_pad(
-                        curr_obs[f"{args.external_camera}_image"], 224, 224
-                    ),
-                    "robot::robot:camera_link:Camera:0::rgb": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
-                    "robot::proprio": np.concatenate([curr_obs["joint_position"], curr_obs["gripper_position"]]),
-                    "prompt": instruction,
-                }
-                # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
-                # Ctrl+C will be handled after the server call is complete
-                with prevent_keyboard_interrupt():
-                    # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
-                    action = policy_client.act(request_data)
-                assert action.shape == (8,), f"Expected action of shape (8,) but got {action.shape}"
+                    # We resize images on the robot laptop to minimize the amount of data sent to the policy server
+                    # and improve latency.
+                    request_data = {
+                        "observation/exterior_image_1_left": image_tools.resize_with_pad(
+                            curr_obs[f"{args.external_camera}_image"], 224, 224
+                        ),
+                        "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
+                        "observation/joint_position": curr_obs["joint_position"],
+                        "observation/gripper_position": curr_obs["gripper_position"],
+                        "prompt": instruction,
+                    }
 
-                # Binarize gripper action (open: 1 -> 0, close: -1 -> 1)
-                if action[-1].item() < 0:
+                    # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
+                    # Ctrl+C will be handled after the server call is complete
+                    with prevent_keyboard_interrupt():
+                        # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
+                        pred_action_chunk = policy_client.infer(request_data)["actions"]
+                    assert pred_action_chunk.shape == (32, 8), f"Expected action chunk of shape (16, 8) but got {pred_action_chunk.shape}"
+
+                # Select current action to execute from chunk
+                action = pred_action_chunk[actions_from_chunk_completed]
+                actions_from_chunk_completed += 1
+
+                # Binarize gripper action
+                if action[-1].item() > 0.5:
                     # action[-1] = 1.0
                     action = np.concatenate([action[:-1], np.ones((1,))])
                 else:
                     # action[-1] = 0.0
                     action = np.concatenate([action[:-1], np.zeros((1,))])
 
+                # clip all dimensions of action to [-1, 1]
+                # action = np.clip(action, -1, 1)
                 env.step(action)
 
                 # Sleep to match DROID data collection frequency
@@ -227,7 +224,7 @@ def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
     robot_state = obs_dict["robot_state"]
     cartesian_position = np.array(robot_state["cartesian_position"])
     joint_position = np.array(robot_state["joint_positions"])
-    gripper_position = np.array([robot_state["gripper_position"], robot_state["gripper_position"]]) * np.pi / 4
+    gripper_position = np.array([robot_state["gripper_position"]])
 
     # Save the images to disk so that they can be viewed live while the robot is running
     # Create one combined image to make live viewing easy
