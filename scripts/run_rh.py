@@ -36,10 +36,14 @@ class Args:
     )
 
     # Rollout parameters
-    max_timesteps: int = 600
+    max_timesteps: int = 1000
     # How many actions to execute from a predicted action chunk before querying policy server again
     # 8 is usually a good default (equals 0.5 seconds of action execution).
-    open_loop_horizon: int = 16
+    open_loop_horizon: int = 8
+    # If enabled, overlapping action chunks are averaged for the current timestep.
+    temporal_ensemble: bool = True
+    # Exponential decay over chunk age. Larger values favor newer action chunks more strongly.
+    temporal_ensemble_decay: float = 0.05
 
     # Remote server parameters
     remote_host: str = "0.0.0.0"  # point this to the IP address of the policy server, e.g., "192.168.1.100"
@@ -75,6 +79,7 @@ def main(args: Args):
     assert (
         args.external_camera is not None and args.external_camera in ["left", "right"]
     ), f"Please specify an external camera to use for the policy, choose from ['left', 'right'], but got {args.external_camera}"
+    assert args.temporal_ensemble_decay >= 0, "temporal_ensemble_decay must be non-negative"
 
     # Initialize the Panda environment. Using joint velocity action space and gripper position action space is very important.
     env = RobotEnv(action_space="joint_position", gripper_action_space="position")
@@ -91,6 +96,7 @@ def main(args: Args):
         # Rollout parameters
         actions_from_chunk_completed = 0
         pred_action_chunk = None
+        action_chunks = []
 
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
@@ -108,12 +114,14 @@ def main(args: Args):
                     save_to_disk=t_step == 0,
                 )
 
-                video.append(curr_obs[f"{args.external_camera}_image"])
+                video.append(
+                    np.concatenate([curr_obs[f"{args.external_camera}_image"], curr_obs["wrist_image"]], axis=0)
+                )
+                print(curr_obs["gripper_position"])
 
                 # Send websocket request to policy server if it's time to predict a new chunk
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     actions_from_chunk_completed = 0
-
                     # We resize images on the robot laptop to minimize the amount of data sent to the policy server
                     # and improve latency.
                     request_data = {
@@ -129,12 +137,25 @@ def main(args: Args):
                     # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
                     # Ctrl+C will be handled after the server call is complete
                     with prevent_keyboard_interrupt():
-                        # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
+                        # This returns an action chunk of joint position actions (7) + gripper position (1).
                         pred_action_chunk = policy_client.infer(request_data)["actions"]
-                    assert pred_action_chunk.shape == (32, 8), f"Expected action chunk of shape (16, 8) but got {pred_action_chunk.shape}"
+                    assert pred_action_chunk.shape == (32, 8), f"Expected action chunk of shape (32, 8) but got {pred_action_chunk.shape}"
+                    action_chunks.append((t_step, pred_action_chunk))
+                    action_chunks = [
+                        (chunk_start, chunk)
+                        for chunk_start, chunk in action_chunks
+                        if chunk_start + chunk.shape[0] > t_step
+                    ]
 
                 # Select current action to execute from chunk
-                action = pred_action_chunk[actions_from_chunk_completed]
+                if args.temporal_ensemble:
+                    action = _ensemble_action_for_timestep(
+                        action_chunks,
+                        t_step,
+                        decay=args.temporal_ensemble_decay,
+                    )
+                else:
+                    action = pred_action_chunk[actions_from_chunk_completed]
                 actions_from_chunk_completed += 1
 
                 # Binarize gripper action
@@ -156,9 +177,9 @@ def main(args: Args):
             except KeyboardInterrupt:
                 break
 
-        video = np.stack(video)
         save_filename = "video_" + timestamp
-        ImageSequenceClip(list(video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
+        video = np.stack(video)
+        ImageSequenceClip(list(video), fps=15).write_videofile(save_filename + ".mp4", codec="libx264")
 
         success: str | float | None = None
         while not isinstance(success, float):
@@ -240,6 +261,32 @@ def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
         "joint_position": joint_position,
         "gripper_position": gripper_position,
     }
+
+
+def _ensemble_action_for_timestep(action_chunks, t_step: int, *, decay: float):
+    actions_for_timestep = []
+    chunk_ages = []
+    newest_action = None
+    newest_chunk_start = None
+    for chunk_start, chunk in action_chunks:
+        chunk_index = t_step - chunk_start
+        if 0 <= chunk_index < chunk.shape[0]:
+            action = chunk[chunk_index]
+            actions_for_timestep.append(action)
+            chunk_ages.append(t_step - chunk_start)
+            if newest_chunk_start is None or chunk_start > newest_chunk_start:
+                newest_action = action
+                newest_chunk_start = chunk_start
+
+    if not actions_for_timestep:
+        raise ValueError(f"No action chunk has a prediction for timestep {t_step}")
+
+    actions_for_timestep = np.stack(actions_for_timestep)
+    chunk_ages = np.array(chunk_ages)
+    weights = np.exp(-decay * chunk_ages)
+    weights = weights / weights.sum()
+    arm_action = np.sum(actions_for_timestep[:, :-1] * weights[:, None], axis=0)
+    return np.concatenate([arm_action, newest_action[-1:]])
 
 
 if __name__ == "__main__":

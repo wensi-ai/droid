@@ -37,10 +37,10 @@ class Args:
 
     # Camera parameters
     # Manual exposure value (0-100). Set to None to use auto exposure.
-    exposure: int | None = 30
+    exposure: int | None = 40
 
     # Rollout parameters
-    max_timesteps: int = 1000
+    max_timesteps: int = 600
 
     # Remote server parameters
     remote_host: str = "0.0.0.0"  # point this to the IP address of the policy server, e.g., "192.168.1.100"
@@ -116,7 +116,9 @@ def main(args: Args):
                     save_to_disk=t_step == 0,
                 )
 
-                video.append(curr_obs[f"{args.external_camera}_image"])
+                video.append(
+                    np.concatenate([curr_obs[f"{args.external_camera}_image"], curr_obs["wrist_image"]], axis=0)
+                )
 
                 # # Visualize camera feeds (images are RGB; convert to BGR for cv2)
                 # vis_external = curr_obs[f"{args.external_camera}_image"][..., ::-1]
