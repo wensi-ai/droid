@@ -6,10 +6,11 @@ This script:
 1. Detects all connected ZED cameras
 2. Opens and configures each camera via the droid ZedCamera class
 3. Streams live feeds from all cameras in a grid layout
-4. Displays camera information (serial number, FPS, frame count)
+4. Optionally displays Video Depth Anything estimates
+5. Displays camera information (serial number, FPS, frame count)
 
 Usage:
-    python scripts/cameras/test_camera.py [--exposure EXPOSURE] [--pc]
+    python scripts/cameras/test_camera.py [--exposure EXPOSURE] [--depth] [--pc]
 
 Controls:
     'q' or ESC - Quit
@@ -25,6 +26,7 @@ import cv2
 import numpy as np
 
 from droid.camera_utils.camera_readers.zed_camera import gather_zed_cameras
+from droid.camera_utils.video_depth_anything import VideoDepthAnythingEstimator
 
 
 DEFAULT_PC_RESOLUTION = (640, 360)
@@ -89,6 +91,12 @@ class ZEDCameraStreamer:
         pc_min_distance=0.1,
         pc_max_distance=5.0,
         pc_point_size=0.005,
+        depth=False,
+        depth_model_root=None,
+        depth_checkpoint=None,
+        depth_encoder="vits",
+        depth_input_size=392,
+        depth_fp32=False,
     ):
         self.zed_cameras = []
         self.exposure = exposure
@@ -100,6 +108,20 @@ class ZEDCameraStreamer:
         self.pc_min_distance = pc_min_distance
         self.pc_max_distance = pc_max_distance
         self.pc_point_size = pc_point_size
+        self.depth = depth
+        self.depth_estimator = None
+        if depth:
+            self.depth_estimator = VideoDepthAnythingEstimator(
+                model_root=depth_model_root,
+                checkpoint_path=depth_checkpoint,
+                encoder=depth_encoder,
+                input_size=depth_input_size,
+                fp32=depth_fp32,
+            )
+            print(
+                "Enabled Video Depth Anything "
+                f"({depth_encoder}, input size {depth_input_size}, device {self.depth_estimator.device})."
+            )
         self.frame_counts = {}
         self.start_time = time.time()
 
@@ -181,7 +203,7 @@ class ZEDCameraStreamer:
         overlay = frame.copy()
         h, w = frame.shape[:2]
 
-        info_height = 125 if self.exposure is not None else 100
+        info_height = 100 + 25 * (self.exposure is not None) + 25 * self.depth
         cv2.rectangle(overlay, (10, 10), (w - 10, info_height), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
 
@@ -194,6 +216,9 @@ class ZEDCameraStreamer:
         cv2.putText(frame, f"FPS: {current_fps:.1f}", (20, 85), font, 0.6, (0, 255, 0), 2)
         if self.exposure is not None:
             cv2.putText(frame, f"Exposure: {self.exposure}", (20, 110), font, 0.6, (0, 255, 255), 2)
+        if self.depth:
+            depth_text_y = 135 if self.exposure is not None else 110
+            cv2.putText(frame, "Depth: Video Depth Anything", (20, depth_text_y), font, 0.6, (255, 255, 0), 2)
 
         return frame
 
@@ -221,12 +246,14 @@ class ZEDCameraStreamer:
             return
 
         print("\n" + "=" * 60)
-        print("Starting camera stream...")
+        stream_type = "Video Depth Anything" if self.depth else "camera"
+        print(f"Starting {stream_type} stream...")
         print("=" * 60)
         print("\nControls:")
         print("  'q' or ESC - Quit\n")
 
-        window_name = f"ZED Camera Stream ({len(self.zed_cameras)} cameras)"
+        window_mode = "Depth" if self.depth else "RGB"
+        window_name = f"ZED {window_mode} Stream ({len(self.zed_cameras)} cameras)"
         window_created = False
         self.start_time = time.time()
         last_display_frame = None
@@ -254,6 +281,10 @@ class ZEDCameraStreamer:
                     if frame is None:
                         frame = next(iter(data_dict["image"].values()))
                     frame = frame[..., :3]
+
+                    if self.depth_estimator is not None:
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame, _ = self.depth_estimator.infer(rgb_frame, stream_name=serial)
 
                     self.frame_counts[serial] += 1
                     frame = self.add_camera_info(frame, serial, self.frame_counts[serial])
@@ -380,6 +411,9 @@ class ZEDCameraStreamer:
             cam.disable_camera()
             print(f"  Closed camera {cam.serial_number}")
 
+        if self.depth_estimator is not None:
+            self.depth_estimator.reset()
+
         print("\nDone!")
 
     def run(self):
@@ -408,6 +442,9 @@ Examples:
 
   # Stream the external ZED point cloud in Viser
   python scripts/cameras/test_camera.py --pc
+
+  # Show temporally consistent monocular depth
+  python scripts/cameras/test_camera.py --depth
         """,
     )
 
@@ -421,6 +458,40 @@ Examples:
         "--pc",
         action="store_true",
         help="Stream external camera point clouds to Viser instead of showing OpenCV images.",
+    )
+    parser.add_argument(
+        "--depth",
+        action="store_true",
+        help="Show Video Depth Anything estimates instead of RGB camera images.",
+    )
+    parser.add_argument(
+        "--depth-model-root",
+        type=str,
+        default=None,
+        help="Video Depth Anything checkout; defaults to libs/Video-Depth-Anything.",
+    )
+    parser.add_argument(
+        "--depth-checkpoint",
+        type=str,
+        default=None,
+        help="Optional Video Depth Anything checkpoint path.",
+    )
+    parser.add_argument(
+        "--depth-encoder",
+        choices=("vits", "vitb", "vitl"),
+        default="vits",
+        help="Video Depth Anything encoder matching the checkpoint.",
+    )
+    parser.add_argument(
+        "--depth-input-size",
+        type=int,
+        default=392,
+        help="Short-side inference resolution for Video Depth Anything.",
+    )
+    parser.add_argument(
+        "--depth-fp32",
+        action="store_true",
+        help="Use full precision instead of CUDA mixed precision.",
     )
     parser.add_argument(
         "--viser-port",
@@ -468,6 +539,8 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.depth and args.pc:
+        parser.error("--depth and --pc are mutually exclusive")
 
     streamer = ZEDCameraStreamer(
         exposure=args.exposure,
@@ -479,6 +552,12 @@ Examples:
         pc_min_distance=args.pc_min_distance,
         pc_max_distance=args.pc_max_distance,
         pc_point_size=args.pc_point_size,
+        depth=args.depth,
+        depth_model_root=args.depth_model_root,
+        depth_checkpoint=args.depth_checkpoint,
+        depth_encoder=args.depth_encoder,
+        depth_input_size=args.depth_input_size,
+        depth_fp32=args.depth_fp32,
     )
     success = streamer.run()
 

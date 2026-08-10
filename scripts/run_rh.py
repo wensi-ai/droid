@@ -43,7 +43,7 @@ class Args:
     # If enabled, overlapping action chunks are averaged for the current timestep.
     temporal_ensemble: bool = True
     # Exponential decay over chunk age. Larger values favor newer action chunks more strongly.
-    temporal_ensemble_decay: float = 0.05
+    temporal_ensemble_decay: float = 0.01
 
     # Remote server parameters
     remote_host: str = "0.0.0.0"  # point this to the IP address of the policy server, e.g., "192.168.1.100"
@@ -117,7 +117,6 @@ def main(args: Args):
                 video.append(
                     np.concatenate([curr_obs[f"{args.external_camera}_image"], curr_obs["wrist_image"]], axis=0)
                 )
-                print(curr_obs["gripper_position"])
 
                 # Send websocket request to policy server if it's time to predict a new chunk
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
@@ -130,7 +129,7 @@ def main(args: Args):
                         ),
                         "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
                         "observation/joint_position": curr_obs["joint_position"],
-                        "observation/gripper_position": curr_obs["gripper_position"],
+                        "observation/gripper_position": (curr_obs["gripper_position"] > 0.5).astype(np.float32),
                         "prompt": instruction,
                     }
 

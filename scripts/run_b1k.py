@@ -17,10 +17,34 @@ from droid.robot_env import RobotEnv
 import tqdm
 import tyro
 
+from droid.camera_utils.video_depth_anything import VideoDepthAnythingEstimator
+
 faulthandler.enable()
 
 # DROID data collection frequency -- we slow down execution to match this frequency
 DROID_CONTROL_FREQUENCY = 15
+
+
+def _compose_rollout_video_frame(
+    rgb_external: np.ndarray,
+    rgb_wrist: np.ndarray,
+    *,
+    depth_external: np.ndarray | None = None,
+    depth_wrist: np.ndarray | None = None,
+) -> np.ndarray:
+    """Stack cameras vertically and, when available, place depth beside RGB."""
+    rgb_column = np.concatenate([rgb_external, rgb_wrist], axis=0)
+    if depth_external is None and depth_wrist is None:
+        return rgb_column
+    if depth_external is None or depth_wrist is None:
+        raise ValueError("Both external and wrist depth frames are required for depth video output")
+
+    depth_column = np.concatenate([depth_external, depth_wrist], axis=0)
+    if depth_column.shape != rgb_column.shape:
+        raise ValueError(
+            f"RGB and depth video columns must have the same shape, got {rgb_column.shape} and {depth_column.shape}"
+        )
+    return np.concatenate([rgb_column, depth_column], axis=1)
 
 
 @dataclasses.dataclass
@@ -38,6 +62,21 @@ class Args:
     # Camera parameters
     # Manual exposure value (0-100). Set to None to use auto exposure.
     exposure: int | None = 40
+
+    # Replace the RGB policy inputs with Video Depth Anything visualizations.
+    depth: bool = False
+    # The local Video Depth Anything checkout. The default resolves to
+    # ../Video-Depth-Anything relative to this DROID checkout.
+    depth_model_root: str | None = None
+    # Optional checkpoint override. By default, use
+    # <depth_model_root>/checkpoints/video_depth_anything_<encoder>.pth.
+    depth_checkpoint: str | None = None
+    # Video Depth Anything encoder. The installed checkpoint uses the small model.
+    depth_encoder: str = "vits"
+    # Short-side inference resolution. 392 balances quality and rollout latency.
+    depth_input_size: int = 392
+    # Use full precision instead of the default CUDA mixed precision.
+    depth_fp32: bool = False
 
     # Rollout parameters
     max_timesteps: int = 600
@@ -77,6 +116,20 @@ def main(args: Args):
         args.external_camera is not None and args.external_camera in ["left", "right"]
     ), f"Please specify an external camera to use for the policy, choose from ['left', 'right'], but got {args.external_camera}"
 
+    depth_estimator = None
+    if args.depth:
+        depth_estimator = VideoDepthAnythingEstimator(
+            model_root=args.depth_model_root,
+            checkpoint_path=args.depth_checkpoint,
+            encoder=args.depth_encoder,
+            input_size=args.depth_input_size,
+            fp32=args.depth_fp32,
+        )
+        print(
+            "Enabled Video Depth Anything "
+            f"({args.depth_encoder}, input size {args.depth_input_size}, device {depth_estimator.device})."
+        )
+
     # Initialize the Panda environment. Using joint position action space and gripper position action space is very important.
     env = RobotEnv(action_space="joint_position", gripper_action_space="position")
     print("Created the droid env!")
@@ -99,6 +152,8 @@ def main(args: Args):
         instruction = input("Enter instruction: ")
         # reset the policy client
         policy_client.reset()
+        if depth_estimator is not None:
+            depth_estimator.reset()
 
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
@@ -116,9 +171,37 @@ def main(args: Args):
                     save_to_disk=t_step == 0,
                 )
 
-                video.append(
-                    np.concatenate([curr_obs[f"{args.external_camera}_image"], curr_obs["wrist_image"]], axis=0)
-                )
+                policy_external_image = curr_obs[f"{args.external_camera}_image"]
+                policy_wrist_image = curr_obs["wrist_image"]
+                if depth_estimator is not None:
+                    policy_external_image, _ = depth_estimator.infer(
+                        policy_external_image,
+                        stream_name="external",
+                    )
+                    policy_wrist_image, _ = depth_estimator.infer(
+                        policy_wrist_image,
+                        stream_name="wrist",
+                    )
+                    if t_step == 0:
+                        Image.fromarray(
+                            np.concatenate([policy_external_image, policy_wrist_image], axis=1)
+                        ).save("robot_depth_views.png")
+
+                    video.append(
+                        _compose_rollout_video_frame(
+                            curr_obs[f"{args.external_camera}_image"],
+                            curr_obs["wrist_image"],
+                            depth_external=policy_external_image,
+                            depth_wrist=policy_wrist_image,
+                        )
+                    )
+                else:
+                    video.append(
+                        _compose_rollout_video_frame(
+                            curr_obs[f"{args.external_camera}_image"],
+                            curr_obs["wrist_image"],
+                        )
+                    )
 
                 # # Visualize camera feeds (images are RGB; convert to BGR for cv2)
                 # vis_external = curr_obs[f"{args.external_camera}_image"][..., ::-1]
@@ -129,11 +212,22 @@ def main(args: Args):
 
                 # We resize images on the robot laptop to minimize the amount of data sent to the policy server
                 # and improve latency.
+                external_obs_key = "external::external_camera_1::rgb"
+                wrist_obs_key = "robot::robot:camera_link:Camera:0::rgb"
+                if depth_estimator is not None:
+                    # Depth robot configs use the simulator's depth_linear key
+                    # names. These values are already encoded uint8 depth images,
+                    # so the OpenPI server preserves them instead of interpreting
+                    # them as raw metric depth.
+                    external_obs_key = "external::external_camera_1::depth_linear"
+                    wrist_obs_key = "robot::robot:camera_link:Camera:0::depth_linear"
                 request_data = {
-                    "external::external_camera_1::rgb": image_tools.resize_with_pad(
-                        curr_obs[f"{args.external_camera}_image"], 224, 224
+                    external_obs_key: image_tools.resize_with_pad(
+                        policy_external_image, 224, 224
                     ),
-                    "robot::robot:camera_link:Camera:0::rgb": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
+                    wrist_obs_key: image_tools.resize_with_pad(
+                        policy_wrist_image, 224, 224
+                    ),
                     "robot::proprio": np.concatenate([curr_obs["joint_position"], curr_obs["gripper_position"]]),
                     "prompt": instruction,
                 }
@@ -162,7 +256,8 @@ def main(args: Args):
                 break
 
         video = np.stack(video)
-        save_filename = "video_" + timestamp
+        video_suffix = "_rgb_depth" if depth_estimator is not None else ""
+        save_filename = "video_" + timestamp + video_suffix
         ImageSequenceClip(list(video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
 
         success: str | float | None = None

@@ -27,9 +27,8 @@ class RobotEnv(gym.Env):
         self.check_action_range = "velocity" in action_space
 
         # Robot Configuration
-        # self.reset_joints = ROBOT_ENV_RESET_JOINTS.copy()
-        # self.reset_joints = np.array([0.00, -1.3, 0.00, -2.87, 0.00, 2.00, 0.00]) # old
-        self.reset_joints = np.array([0.00, -0.7853, 0.00, -2.35619, 0.00, 1.57079, 0.0]) # fridge
+        self.reset_joints = np.array([0.00, -1.3, 0.00, -2.87, 0.00, 2.00, 0.00]) # old
+        # self.reset_joints = np.array([0.00, -0.7853, 0.00, -2.35619, 0.00, 1.57079, 0.0]) # fridge
 
         self.randomize_low = np.array([-0.1, -0.2, -0.1, -0.3, -0.3, -0.3])
         self.randomize_high = np.array([0.1, 0.2, 0.1, 0.3, 0.3, 0.3])
